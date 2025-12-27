@@ -1,0 +1,617 @@
+import os
+import hmac
+import base64
+import getpass
+import struct
+import math
+import numpy as np
+from typing import Dict, Tuple
+from hashlib import sha256
+from argon2 import PasswordHasher
+from collections import Counter
+
+# =============================
+# Secret key (system-wide constant)
+# =============================
+SECRET_KEY = b"super_secret_research_key"
+
+# =============================
+# Helper functions
+# =============================
+
+# def safe_float_from_bytes(b: bytes, precision: int = 6) -> float:
+#     """
+#     Converts 4 bytes into a safe IEEE-754 float with controlled range and precision.
+#     Avoids too many zeros, denormals, NaNs, or extreme values.
+#     """
+#     # Convert bytes to uint32 bits
+#     bits = int.from_bytes(b, byteorder='big')
+#     sign = (bits >> 31) & 0x1
+#     exponent = (bits >> 23) & 0xFF
+#     mantissa = bits & 0x7FFFFF
+
+#     # Clamp exponent to avoid denormals, zeros, Inf, NaN
+#     if exponent == 0 or exponent == 255:
+#         exponent = 127  # bias for exponent 0 → safe normal number
+
+#     # Clamp mantissa to avoid exact zero
+#     if mantissa == 0:
+#         mantissa = 1
+
+#     safe_bits = (sign << 31) | (exponent << 23) | mantissa
+#     safe_bytes = safe_bits.to_bytes(4, byteorder='big')
+
+#     val = struct.unpack('>f', safe_bytes)[0]
+
+#     # Clamp magnitude to avoid extremes
+#     min_val = 1e-6
+#     max_val = 1e6
+#     val = max(min(val, max_val), -max_val)
+#     if abs(val) < min_val:
+#         val = min_val if val >= 0 else -min_val
+
+#     return round(val, precision)
+
+
+def safe_float_from_bytes(b: bytes, precision: int = 6) -> float:
+    """
+    Converts 4 bytes into a safe IEEE-754 float with controlled range and precision.
+    Avoids too many zeros, denormals, NaNs, or extreme values.
+    """
+    # Convert bytes to uint32 bits
+    bits = int.from_bytes(b, byteorder='big')
+    sign = (bits >> 31) & 0x1
+    exponent = (bits >> 23) & 0xFF
+    mantissa = bits & 0x7FFFFF
+
+    # Clamp exponent to avoid denormals, zeros, Inf, NaN
+    if exponent == 0 or exponent == 255:
+        exponent = 127  # bias for exponent 0 → safe normal number
+
+    # Clamp mantissa to avoid exact zero
+    if mantissa == 0:
+        mantissa = 1
+
+    safe_bits = (sign << 31) | (exponent << 23) | mantissa
+    safe_bytes = safe_bits.to_bytes(4, byteorder='big')
+
+    val = struct.unpack('>f', safe_bytes)[0]
+
+    # Clamp magnitude to avoid extremes
+    min_val = 1e-6
+    max_val = 1e6
+    val = max(min(val, max_val), -max_val)
+    if abs(val) < min_val:
+        val = min_val if val >= 0 else -min_val
+
+    return round(val, precision)
+
+
+def generate_user_range(salt1: bytes, salt2: bytes) -> Tuple[float, float]:
+    """
+    Generates a user-specific, unpredictable, and IEEE 754-safe float range (x_min, x_max),
+    derived from secure HMAC outputs. Ensures the range is not too narrow or too large
+    for safe mathematical operations in plot-based password hashing.
+    """
+
+    def extract_strong_float(hmac_bytes: bytes) -> float:
+        """
+        Converts 4 bytes of HMAC output into a safe float value.
+        Scales it logarithmically to keep within a safe range (≈ 1.0 to 1000.0),
+        avoiding float overflows, underflows, NaNs, or denormals.
+        """
+        val = safe_float_from_bytes(hmac_bytes[:4], precision=6)  # Convert raw bytes to float
+        abs_val = abs(val) if val != 0 else 1.0      # Avoid log10(0)
+        exponent = math.log10(abs_val)               # Get magnitude
+        scaled = exponent % 3.0                      # Clamp to [0, 3)
+        return 10 ** scaled                          # Result in [1.0, 1000.0)
+
+    # Step 1: Generate HMAC digests using salts and context strings to get unique values
+    hmac_min = hmac.new(SECRET_KEY, salt1 + salt2 + b'unpredictable_x_min', sha256).digest()
+    hmac_max = hmac.new(SECRET_KEY, salt1 + salt2 + b'unpredictable_x_max', sha256).digest()
+
+    # Step 2: Convert those digests to safe floats using the helper
+    min_val = extract_strong_float(hmac_min)
+    max_val = extract_strong_float(hmac_max)
+
+    # Step 3: Swap if max < min to maintain correct order
+    if max_val < min_val:
+        min_val, max_val = max_val, min_val
+
+    # Step 4: Ensure range has a minimum gap; too small a range causes bad normalization
+    if abs(max_val - min_val) < 1.0:
+        # Add additional gap derived from another HMAC to keep it user-specific
+        separation_hmac = hmac.new(SECRET_KEY, salt1 + salt2 + b'separation', sha256).digest()
+        separation = round(safe_float_from_bytes(separation_hmac[:4]) % 10.0, 6)  # Add up to 10 units
+        max_val = round(min_val + separation + 1.5, 6)  # Final adjusted max value
+
+    return round(min_val, 6), round(max_val, 6)
+
+# def generate_user_param_range(salt1: bytes, salt2: bytes, label: bytes) -> Tuple[float, float]:
+#     """
+#     Generates a user-specific safe range for parameters (p1, p2).
+#     Uses the same strong float extraction as for x normalization,
+#     but with different labels for unpredictability.
+#     """
+#     def extract_strong_float(hmac_bytes: bytes) -> float:
+#         val = safe_float_from_bytes(hmac_bytes[:4], precision=6)
+#         abs_val = abs(val) if val != 0 else 1.0
+#         exponent = math.log10(abs_val)
+#         scaled = exponent % 2.0   # clamp to smaller range than x
+#         return 10 ** scaled       # in [1.0, 100.0)
+
+#     hmac_min = hmac.new(SECRET_KEY, salt1 + salt2 + label + b'_min', sha256).digest()
+#     hmac_max = hmac.new(SECRET_KEY, salt1 + salt2 + label + b'_max', sha256).digest()
+
+#     min_val = extract_strong_float(hmac_min)
+#     max_val = extract_strong_float(hmac_max)
+
+#     if max_val < min_val:
+#         min_val, max_val = max_val, min_val
+#     if abs(max_val - min_val) < 1.0:
+#         # Add additional gap derived from another HMAC to keep it user-specific
+#         separation_hmac = hmac.new(SECRET_KEY, salt1 + salt2 + b'separation', sha256).digest()
+#         separation = round(safe_float_from_bytes(separation_hmac[:4]) % 10.0, 6)  # Add up to 10 units
+#         max_val = round(min_val + separation + 1.5, 6)  # Final adjusted max value
+
+#     return round(min_val, 6), round(max_val, 6)
+
+def generate_user_param_range(salt1: bytes, salt2: bytes, label: bytes) -> Tuple[float, float]:
+    """
+    Generates a user-specific, cryptographically unpredictable safe range for parameters (p1, p2).
+    The randomness is derived from HMACs of salts + label, then mapped into a safe [a, b] range
+    without clustering near 1.0.
+    """
+
+    def extract_strong_float(hmac_bytes: bytes) -> float:
+        # Convert bytes into a safe float
+        base_val = safe_float_from_bytes(hmac_bytes[:4], precision=6)
+
+        # Derive a secondary randomness factor from additional bits
+        extra_bits = int.from_bytes(hmac_bytes[4:8], byteorder='big')
+        frac_rand = (extra_bits % 10000) / 10000.0  # → [0, 1)
+
+        # Combine both into a pseudo-random safe float, then scale logarithmically
+        combined = abs(base_val) * (1 + frac_rand)
+
+        # Log scaling keeps it within meaningful numeric bounds but avoids clustering
+        scaled = (math.log10(combined + 1e-6) + 6) % 3.0  # result ∈ [0, 3)
+        return round(10 ** scaled, 6)  # → range roughly [1, 1000)
+
+    # --- Derive cryptographically strong seeds for both bounds
+    hmac_min = hmac.new(SECRET_KEY, salt1 + salt2 + label + b'_min', sha256).digest()
+    hmac_max = hmac.new(SECRET_KEY, salt1 + salt2 + label + b'_max', sha256).digest()
+
+    min_val = extract_strong_float(hmac_min)
+    max_val = extract_strong_float(hmac_max)
+
+    # --- Ensure correct ordering and minimum separation
+    if max_val < min_val:
+        min_val, max_val = max_val, min_val
+
+    # Enforce a nontrivial spread
+    if abs(max_val - min_val) < 5.0:
+        sep_hmac = hmac.new(SECRET_KEY, salt1 + salt2 + label + b'_sep', sha256).digest()
+        separation = (int.from_bytes(sep_hmac[:2], 'big') % 50) / 10.0  # → up to +5.0 spread
+        max_val = round(min_val + 5.0 + separation, 6)
+
+    return round(min_val, 6), round(max_val, 6)
+
+
+def normalize_param(value: float, param_min: float, param_max: float, method: str = "linear") -> float:
+    """
+    Normalizes a single parameter into a user-specific safe range using multiple strategies.
+    
+    Parameters:
+        value: float - the raw input value
+        param_min: float - minimum of target range
+        param_max: float - maximum of target range
+        method: str - which normalization strategy to use:
+            "linear"  -> simple linear scaling (default)
+            "log"     -> logarithmic normalization
+            "clipped" -> clipping-based normalization
+            "tanh"    -> tanh-based normalization
+
+    Returns:
+        float: normalized value rounded to 6 decimals
+    """
+
+    # Convert value to a numpy array for uniform processing
+    x = np.array([value], dtype=np.float64)
+
+    # --- Option 1: Linear Normalization ---
+    def linear_norm(x):
+        scaled = abs(x) % 1.0
+        return param_min + scaled * (param_max - param_min)
+
+    # --- Option 2: Logarithmic Normalization ---
+    def log_norm(x):
+        safe_val = np.clip(np.abs(x), 1e-30, 1e30)
+        log_val = np.log10(safe_val)
+        # Since only one value, log_min = log_max = log_val
+        log_min, log_max = log_val, log_val
+        # Avoid divide by zero
+        if abs(log_max - log_min) < 1e-6:
+            log_max = log_min + 1.0
+        normed = (log_val - log_min) / (log_max - log_min)
+        return param_min + normed * (param_max - param_min)
+
+    # --- Option 3: Clipping-Based Normalization ---
+    def clipped_norm(x):
+        # For single value, clipping does nothing, just map 0–1
+        lower, upper = -1.0, 1.0  # simple safe clipping range for single value
+        clipped = np.clip(x, lower, upper)
+        normed = (clipped - lower) / (upper - lower)
+        return param_min + normed * (param_max - param_min)
+
+    # --- Option 4: Tanh-Based Normalization ---
+    def tanh_norm(x):
+        scale = 1e10  # tuneable
+        squashed = np.tanh(x / scale)
+        tanh_min, tanh_max = squashed, squashed
+        if abs(tanh_max - tanh_min) < 1e-6:
+            tanh_max = tanh_min + 1.0
+        normed = (squashed - tanh_min) / (tanh_max - tanh_min)
+        return param_min + normed * (param_max - param_min)
+
+    # === Choose method ===
+    methods = {
+        "linear": linear_norm,
+        "log": log_norm,
+        "clipped": clipped_norm,
+        "tanh": tanh_norm
+    }
+
+    if method not in methods:
+        raise ValueError(f"Unknown normalization method: {method}")
+
+    normalized = methods[method](x)[0]  # extract scalar from array
+    return round(normalized, 6)
+
+def normalize_x_values_to_custom_range(xs: list[float], x_min: float, x_max: float) -> list[float]:
+    """
+    Supports multiple normalization strategies. Switch between them by commenting/uncommenting.
+    """
+
+    xs = np.array(xs, dtype=np.float64)
+
+    ### --- Option 1: Original Linear Normalization ---
+    # Purpose: simple min-max normalization
+    # Strengths: fast, straightforward
+    # Weakness: fails with extreme outliers
+    def linear_normalization(xs):
+        x_raw_min = np.min(xs)
+        x_raw_max = np.max(xs)
+        if abs(x_raw_max - x_raw_min) < 1e-6:
+            x_raw_max = x_raw_min + 1.0
+        normalized = (xs - x_raw_min) / (x_raw_max - x_raw_min)
+        return x_min + normalized * (x_max - x_min)
+
+    ### --- Option 2: Logarithmic Normalization ---
+    # Purpose: compresses wide-magnitude values
+    # Strengths: handles extreme differences well
+    # Weakness: loses sign (uses abs), needs log-safe values
+    def log_normalization(xs):
+        safe_vals = np.clip(np.abs(xs), 1e-30, 1e+30)
+        log_vals = np.log10(safe_vals)
+        log_min = np.min(log_vals)
+        log_max = np.max(log_vals)
+        if abs(log_max - log_min) < 1e-6:
+            log_max = log_min + 1.0
+        normalized = (log_vals - log_min) / (log_max - log_min)
+        return x_min + normalized * (x_max - x_min)
+
+    ### --- Option 3: Clipping-Based Normalization ---
+    # Purpose: remove impact of extreme outliers
+    # Strengths: great for heavily skewed values
+    # Weakness: clipping may lose useful high-magnitude info
+    def clipped_normalization(xs):
+        lower, upper = np.percentile(xs, [1, 99])
+        clipped = np.clip(xs, lower, upper)
+        normed = (clipped - lower) / (upper - lower)
+        return x_min + normed * (x_max - x_min)
+
+    ### --- Option 4: Tanh-Based Normalization ---
+    # Purpose: squashes values into (-1, 1)
+    # Strengths: strong outlier control, keeps sign
+    # Weakness: output distribution may concentrate around center
+    def tanh_normalization(xs):
+        scale = 1e10  # Can tune this
+        squashed = np.tanh(xs / scale)
+        tanh_min = np.min(squashed)
+        tanh_max = np.max(squashed)
+        if abs(tanh_max - tanh_min) < 1e-6:
+            tanh_max = tanh_min + 1.0
+        normed = (squashed - tanh_min) / (tanh_max - tanh_min)
+        return x_min + normed * (x_max - x_min)
+
+    # === Select which one to use ===
+    # normalized = linear_normalization(xs)       # <- Default (Option 1)
+    normalized = log_normalization(xs)        # <- Uncomment for Option 2
+    # normalized = clipped_normalization(xs)    # <- Uncomment for Option 3
+    # normalized = tanh_normalization(xs)       # <- Uncomment for Option 4
+
+    return np.round(normalized, 6).tolist()
+
+def iterative_plot_transform(password: str, salt1: bytes, salt2: bytes, iterations: int = 3):
+    """
+    Apply the Plot transformation iteratively.
+    Each iteration treats the previous output binary as the next 'password'.
+    Returns the final binary and optionally all intermediate binaries.
+    """
+    current_input = password.encode()
+    all_intermediates = []
+
+    for it in range(1, iterations + 1):
+        combined_input = current_input + salt1 + salt2
+        x_raw_values = []
+
+        # Map each byte/char to function
+        for b in combined_input:
+            char = chr(b % 256)
+            plot_type, p1, p2, x = map_char_to_function_with_x(char, salt1, salt2)
+            x_raw_values.append(x)
+
+        # Normalize
+        user_x_min, user_x_max = generate_user_range(salt1, salt2)
+        x_values = normalize_x_values_to_custom_range(x_raw_values, user_x_min, user_x_max)
+
+        # Apply plot functions
+        values = []
+        for i, b in enumerate(combined_input):
+            char = chr(b % 256)
+            plot_type, p1, p2, x = map_char_to_function_with_x(char, salt1, salt2)
+            result = apply_plot_function(plot_type, p1, p2, x_values[i])
+            values.append(result)
+
+        # Convert to binary
+        binary_data = struct.pack(f'{len(values)}f', *values)
+        all_intermediates.append(binary_data)
+
+        # Next iteration input
+        current_input = binary_data
+
+    return current_input, all_intermediates
+
+# =============================
+# Plot mapping function
+# =============================
+
+def apply_plot_function(plot_type: int, p1: float, p2: float, x: float) -> float:
+    """
+    Safe execution engine for very large mathematical functions.
+    Supports polynomials up to x**20, nested trig/log/exp, combinations,
+    and clamps values to avoid float overflow or NaN propagation.
+    """
+
+    # Soft safety bounds
+    MAX_MAG = 1e12       # prevents explosion
+    MIN_MAG = 1e-12      # prevents underflow to 0
+
+    def clamp(v):
+        if math.isnan(v) or math.isinf(v):
+            return 0.0
+        if v > MAX_MAG: return MAX_MAG
+        if v < -MAX_MAG: return -MAX_MAG
+        if abs(v) < MIN_MAG: return MIN_MAG * (1 if v >= 0 else -1)
+        return v
+
+    try:
+        # === Monster functions registry ===
+        if plot_type == 0:
+            # Example of a monster polynomial + trig + exp chain
+            val = (
+                p1*x**8
+                - p2*x**6
+                + p1**2 * x**5
+                + math.sin(p1 * x**3)
+                + math.exp(p2 * x / (1 + abs(x)))
+                - p1*math.log(abs(x) + 10)
+            )
+
+        elif plot_type == 1:
+            # Deeply nested hybrid function (safe)
+            val = (
+                (p1*x**12 - p2*x**9 + p1*x**4)
+                / (1 + math.exp(-p2 * x))
+                + math.tan(math.sin(p1 * x)))
+        elif plot_type == 2:
+            # Oscillatory monster polynomial with log & exp
+            val = (
+                p1*x**10 + p2*x**7 - p1*x**3
+                + math.sin(x**2)
+                + math.log(abs(p2*x) + 5)
+                - math.exp(-abs(x))
+            )
+        elif plot_type == 3:
+            # Highly chaotic exp–log–poly mix
+            val = (
+                p1 * math.exp(math.sin(p2 * x))
+                - p2 * math.log(abs(x*p1) + 2)
+                + x**5 - x**4 + p1*x**2
+            )
+
+        elif plot_type == 4:
+            # Heavy trig chain
+            val = (
+                math.sin(p1 * x**3)
+                + math.cos(p2 * x**2)
+                + math.tan(p1 * x / (1 + abs(x)))
+            )
+
+        elif plot_type == 5:
+            # Full monster polynomial (degree 20 safe)
+            val = (
+                p1*x**20 - p2*x**17 + p1*x**14
+                - p1*p2*x**10 + p2*x**8
+                + math.sin(x) + math.exp(-abs(p1*x))
+            )
+        else:
+            val = 0.0
+
+        return clamp(val)
+
+    except:
+        return 0.0
+
+
+def map_char_to_function_with_x(char: str, salt1: bytes, salt2: bytes) -> Tuple[int, float, float, float]:
+    char_bytes = char.encode('utf-8')
+
+    hmac_type = hmac.new(SECRET_KEY, salt1 + salt2 + char_bytes + b'type', sha256).digest()
+    plot_type = hmac_type[0] % 6
+
+    hmac_p1 = hmac.new(SECRET_KEY, salt1 + salt2 + char_bytes + b'p1', sha256).digest()
+    raw_p1 = safe_float_from_bytes(hmac_p1[:4])
+
+    hmac_p2 = hmac.new(SECRET_KEY, salt1 + salt2 + char_bytes + b'p2', sha256).digest()
+    raw_p2 = safe_float_from_bytes(hmac_p2[:4])
+
+    # === New: normalize p1 and p2 into user-specific ranges ===
+    p1_min, p1_max = generate_user_param_range(salt1, salt2, b'p1')
+    p2_min, p2_max = generate_user_param_range(salt1, salt2, b'p2')
+
+    p1 = normalize_param(raw_p1, p1_min, p1_max, method="log")
+    p2 = normalize_param(raw_p2, p2_min, p2_max, method="log")
+
+    hmac_x = hmac.new(SECRET_KEY, salt1 + salt2 + char_bytes + b'x', sha256).digest()
+    x = safe_float_from_bytes(hmac_x[:4])
+
+     # Debug print for ranges
+    # print(f"    [RANGE] p1_min={p1_min:.6f}, p1_max={p1_max:.6f} | p2_min={p2_min:.6f}, p2_max={p2_max:.6f}")
+
+    return plot_type, p1, p2, x
+
+# =============================
+# Secure password hashing pipeline
+# =============================
+
+
+ph = PasswordHasher(time_cost=3, memory_cost=64 * 1024, parallelism=4, hash_len=32)
+
+
+def secure_hash_password(password: str, salt1: bytes, salt2: bytes) -> bytes:
+    # combined_input = password.encode() + salt1 + salt2
+
+    iterations = 4  # you can adjust this
+
+    final_binary, all_intermediates = iterative_plot_transform(password, salt1, salt2, iterations)
+
+
+    # x_raw_values = []
+    # for b in combined_input:
+    #     char = chr(b)
+    #     _, p1, p2, x = map_char_to_function_with_x(char, salt1, salt2)
+    #     x_raw_values.append(x)
+
+    # user_x_min, user_x_max = generate_user_range(salt1, salt2)
+    # x_values = normalize_x_values_to_custom_range(x_raw_values, user_x_min, user_x_max)
+
+    # values = []
+    # for i, b in enumerate(combined_input):
+    #     char = chr(b)
+    #     plot_type, p1, p2, _ = map_char_to_function_with_x(char, salt1, salt2)
+    #     values.append(apply_plot_function(plot_type, p1, p2, x_values[i]))
+
+    # binary_data = struct.pack(f'{len(values)}f', *values)
+
+    # ph = PasswordHasher(time_cost=3, memory_cost=64 * 1024, parallelism=4, hash_len=32)
+    return final_binary
+
+
+# =============================
+# User database
+# =============================
+users: Dict[str, Dict[str, str]] = {}
+
+
+
+def register_user(username: str, password: str):
+    if username in users:
+        print("[!] Username already exists.")
+        return
+
+    # Generate two salts for the full pipeline
+    salt1 = os.urandom(8)  # 8 bytes for salt1
+    salt2 = os.urandom(8)  # 8 bytes for salt2
+
+    transformed = secure_hash_password(password, salt1, salt2)
+    hashed_password = ph.hash(transformed)
+
+    users[username] = {
+        "salt1": base64.b64encode(salt1).decode(),
+        "salt2": base64.b64encode(salt2).decode(),
+        "hash": hashed_password,
+        "password": password  #  store raw password for debug/demo only
+    }
+    print(f"[+] User '{username}' registered successfully!")
+
+
+def authenticate_user(username: str, password: str):
+    if username not in users:
+        print("[!] Username not found.")
+        return False
+
+    user_record = users[username]
+    salt1 = base64.b64decode(user_record["salt1"])
+    salt2 = base64.b64decode(user_record["salt2"])
+    stored_hash = user_record["hash"]
+
+    try:
+        transformed = secure_hash_password(password, salt1, salt2)
+        print(f"\nStored hash {stored_hash}, \n\nRecomputed hash {transformed.hex()}")
+        if ph.verify(stored_hash, transformed):  # We must verify correctly
+            print(f"[✓] Authentication successful for '{username}'!")
+            return True
+    except Exception as e:
+        print(f"[!] Authentication error: {e}")
+        return False
+
+    print("[!] Authentication failed: wrong password.")
+    return False
+
+
+
+# =============================
+# CLI loop
+# =============================
+def main():
+    while True:
+        print("\n--- User System ---")
+        print("1. Register")
+        print("2. Login")
+        print("3. Show DB (debug)")
+        print("4. Exit")
+
+        choice = input("Select an option: ").strip()
+
+        if choice == "1":
+            username = input("Enter username: ").strip()
+            # 🔹 use normal input so password is visible
+            password = input("Enter password: ")  
+            register_user(username, password)
+
+        elif choice == "2":
+            username = input("Enter username: ").strip()
+            password = input("Enter password: ")  # 🔹 visible on typing
+            authenticate_user(username, password)
+
+        elif choice == "3":
+            print("\n[DEBUG] Current User Database:")
+            for user, record in users.items():
+                print(f"User: {user}")
+                print(f"  Password: {record['password']}")
+                print(f"  Salt1: {record['salt1']}")
+                print(f"  Salt2: {record['salt2']}")
+                print(f"  Hash: {record['hash']}\n")
+
+        elif choice == "4":
+            print("Exiting...")
+            break
+
+        else:
+            print("[!] Invalid choice.")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,20 @@
+Function	|                            Purpose	                                        |   Why Important
+
+safe_float_from_bytes	|                   Turn bytes into valid floats	  |              Prevents unsafe IEEE floats
+
+generate_user_range	    |                   Create user-specific normalization bounds  |	 Increases uniqueness, prevents float issues
+
+normalize_x_values_to_custom_range |	    Normalize x values	      |                      Ensures consistency and safe input
+
+apply_plot_function	    |                   Apply math transformation	     |               Adds complexity, irreversibility
+
+map_char_to_function_with_x	 |              Get plot type & params for char	     |           Deterministic + user-specific mapping
+
+
+entropy	                |                   Compute randomness	      |                      Measures strength/security of hash output
+
+compare_methods	   |                        Full benchmarking pipeline	    |                Runs all methods and collects stats
+
+print_results	|                           Display results cleanly	    |                    Helps compare methods clearly
+
+matplotlib plots    |                   	Visualize time/entropy/output   |                Benchmark visualization
